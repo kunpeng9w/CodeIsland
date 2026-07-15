@@ -26,6 +26,13 @@ public enum EventNormalizer {
         case "userPromptSubmitted":   return "UserPromptSubmit"
         case "preToolUse":            return "PreToolUse"
         case "postToolUse":           return "PostToolUse"
+        case "postToolUseFailure":    return "PostToolUseFailure"
+        case "permissionRequest":     return "PermissionRequest"
+        case "notification":          return "Notification"
+        case "agentStop":             return "Stop"
+        case "subagentStart":         return "SubagentStart"
+        case "subagentStop":          return "SubagentStop"
+        case "preCompact":            return "PreCompact"
         case "errorOccurred":         return "Notification"
         // Kiro CLI (camelCase, agent-scoped)
         case "agentSpawn":            return "SessionStart"
@@ -42,7 +49,6 @@ public enum EventNormalizer {
         case "subagent_stop":         return "SubagentStop"
         case "pre_compact":           return "PreCompact"
         case "post_compact":          return "PostCompact"
-        case "notification":          return "Notification"
         // Hermes (Nous Research) — snake_case but diverged from Claude/Gemini (#226).
         // `subagent_stop` already maps to SubagentStop in the traecli block above.
         case "pre_tool_call":         return "PreToolUse"

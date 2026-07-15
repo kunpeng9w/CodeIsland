@@ -26,6 +26,41 @@ final class ConfigInstallerTests: XCTestCase {
         let hooks = try XCTUnwrap(hooksAny as? [Any], file: file, line: line)
         return hooks.compactMap { $0 as? [String: Any] }
     }
+
+    func testMergeVSCodeCopilotHookLocationPreservesExistingJSONC() throws {
+        let original = """
+        {
+          // Keep this comment.
+          "editor.fontSize": 15,
+          "chat.hookFilesLocations": {
+            "~/.claude/hooks": true,
+          },
+        }
+        """
+
+        let merged = try XCTUnwrap(ConfigInstaller.mergeVSCodeCopilotHookLocation(in: original))
+
+        XCTAssertTrue(merged.contains("// Keep this comment."))
+        XCTAssertTrue(merged.contains(#""editor.fontSize": 15"#))
+        XCTAssertTrue(merged.contains(#""~/.claude/hooks": true"#))
+        XCTAssertTrue(merged.contains(#""~/.copilot/hooks": true"#))
+    }
+
+    func testEnsureVSCodeCopilotHookLocationCreatesSettingInExistingUserDirectory() throws {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+        let settingsPath = tempDir.appendingPathComponent("settings.json").path
+
+        XCTAssertTrue(ConfigInstaller.ensureVSCodeCopilotHookLocation(fm: fm, settingsPath: settingsPath))
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: settingsPath))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let locations = try XCTUnwrap(root["chat.hookFilesLocations"] as? [String: Any])
+        XCTAssertEqual(locations["~/.copilot/hooks"] as? Bool, true)
+    }
+
     func testRemoveManagedHookEntriesAlsoPrunesLegacyVibeIslandHooks() throws {
         let hooks: [String: Any] = [
             "SessionEnd": [
@@ -754,6 +789,47 @@ hooks:
         let script = RemoteInstaller.configureRemoteHooksScript(host: host)
 
         XCTAssertTrue(script.contains(#"socket_path = "/tmp/codeisland.sock""#))
+    }
+
+    func testRemoteInstallerConfigureScriptInstallsFullCodexEventSet() throws {
+        let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
+
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host)
+
+        for event in [
+            "SessionStart",
+            "SessionEnd",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "Stop",
+        ] {
+            XCTAssertTrue(
+                script.contains(#"append_our_hooks(hooks, "\#(event)","#),
+                "missing \(event)"
+            )
+        }
+        XCTAssertTrue(script.contains(#"long_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 86400}]}]"#))
+        XCTAssertTrue(script.contains(#"append_our_hooks(hooks, "PermissionRequest", long_entry)"#))
+        try assertPythonCompiles(script)
+    }
+
+    func testRemoteInstallerConfigureScriptInstallsCopilotForVSCodeRemote() throws {
+        let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
+
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host)
+
+        XCTAssertTrue(script.contains("def install_copilot():"))
+        XCTAssertTrue(script.contains(#"copilot_root / "hooks" / "codeisland.json""#))
+        XCTAssertTrue(script.contains(#"(home / ".vscode-server").exists()"#))
+        XCTAssertTrue(script.contains(#"command_for("copilot")"#))
+        XCTAssertTrue(script.contains(#"("preToolUse", 86400)"#))
+        XCTAssertTrue(script.contains(#"("permissionRequest", 86400)"#))
+        XCTAssertTrue(script.contains(#"--event {event}"#))
+        XCTAssertTrue(script.contains("append_our_hooks(\n            hooks,\n            event,"))
+        XCTAssertTrue(script.contains("install_copilot()"))
+        try assertPythonCompiles(script)
     }
 
     func testRemoteOpencodePluginInjectsPerUserSocketPath() {

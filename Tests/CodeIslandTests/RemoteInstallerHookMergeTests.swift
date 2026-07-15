@@ -120,6 +120,36 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         XCTAssertTrue(cmds.contains { $0.contains("codeisland-remote-hook.py") }, "our hook missing: \(cmds)")
     }
 
+    func testCopilotInstallPreservesUserHooksAndIsIdempotent() throws {
+        let userEntry: [String: Any] = [
+            "type": "command",
+            "bash": "echo copilot-user-hook",
+            "timeoutSec": 5,
+        ]
+        try writeJSON(
+            ["version": 1, "hooks": ["preToolUse": [userEntry]]],
+            to: ".copilot/hooks/codeisland.json"
+        )
+
+        try runConfigureScript()
+        try runConfigureScript()
+
+        let settings = try readJSON(".copilot/hooks/codeisland.json")
+        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
+        let preToolUse = try XCTUnwrap(hooks["preToolUse"] as? [[String: Any]])
+        let commands = preToolUse.compactMap { $0["bash"] as? String }
+        XCTAssertEqual(
+            commands.filter { $0.contains("copilot-user-hook") }.count,
+            1,
+            "user hook was duplicated or wiped: \(commands)"
+        )
+        XCTAssertEqual(
+            commands.filter { $0.contains("codeisland-remote-hook.py") }.count,
+            1,
+            "our hook was not installed idempotently: \(commands)"
+        )
+    }
+
     func testCodeBuddyInstallPreservesUserHooks() throws {
         let userEntry: [String: Any] = [
             "matcher": "*",

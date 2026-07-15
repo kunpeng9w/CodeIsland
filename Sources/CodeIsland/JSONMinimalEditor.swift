@@ -37,6 +37,30 @@ enum JSONMinimalEditor {
         return insertKey(chars: chars, doc: doc, key: key, serialized: serialized, keyIndent: indent)
     }
 
+    /// Set a member inside a top-level object while preserving the surrounding
+    /// document and any comments already present inside that object.
+    static func setTopLevelObjectMember(
+        in source: String,
+        objectKey: String,
+        memberKey: String,
+        value: Any
+    ) -> String? {
+        let chars = Array(source)
+        guard let doc = parseTopLevelObject(chars: chars) else { return nil }
+        guard let entry = doc.entries.first(where: { $0.key == objectKey }) else {
+            return setTopLevelValue(in: source, key: objectKey, value: [memberKey: value])
+        }
+
+        let objectText = String(chars[entry.valueStart..<entry.valueEnd])
+        guard let updatedObject = setTopLevelValue(in: objectText, key: memberKey, value: value) else {
+            return nil
+        }
+
+        let prefix = String(chars[..<entry.valueStart])
+        let suffix = String(chars[entry.valueEnd...])
+        return prefix + updatedObject + suffix
+    }
+
     /// Delete a top-level `key` from `source`. Returns `source` unchanged if key missing.
     /// Returns `nil` if `source` is not a valid JSON object at top level.
     static func deleteTopLevelKey(in source: String, key: String) -> String? {
