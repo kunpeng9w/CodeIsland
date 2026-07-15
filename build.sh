@@ -126,18 +126,27 @@ build_mac() {
 
     ENTITLEMENTS="CodeIsland.entitlements"
 
-    # Use SIGN_ID env var, or auto-detect: prefer "Developer ID Application" for distribution,
-    # fall back to any valid identity, then ad-hoc
+    # Use SIGN_ID env var, or auto-detect a distribution identity. Other local
+    # identities may produce a signature whose certificate chain is not trusted
+    # when the app is copied into /Applications, so fall back to ad-hoc instead.
     if [ -z "${SIGN_ID:-}" ]; then
         SIGN_ID=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null || true)
-    fi
-    if [ -z "$SIGN_ID" ]; then
-        SIGN_ID=$(security find-identity -v -p codesigning | grep -v "REVOKED" | grep '"' | head -1 | sed 's/.*"\(.*\)".*/\1/' 2>/dev/null || true)
     fi
     if [ -z "$SIGN_ID" ]; then
         echo "No developer certificate found, using ad-hoc signing..."
         SIGN_ID="-"
     fi
+
+    sign_item() {
+        if [ "$SIGN_ID" = "-" ]; then
+            # Hardened Runtime library validation requires matching Team IDs.
+            # Ad-hoc signatures have no Team ID, so enabling it prevents the
+            # main executable from loading the bundled Sparkle framework.
+            codesign --force --sign "$SIGN_ID" "$@"
+        else
+            codesign --force --options runtime --sign "$SIGN_ID" "$@"
+        fi
+    }
 
     echo "Code signing ($SIGN_ID)..."
     # Sign embedded frameworks first (inside-out).
@@ -145,18 +154,18 @@ build_mac() {
     # Sign nested helpers inside Sparkle before the framework itself.
     for xpc in "$SPARKLE_FW/Versions/B/XPCServices/"*.xpc; do
         [ -e "$xpc" ] || continue
-        codesign --force --options runtime --sign "$SIGN_ID" "$xpc"
+        sign_item "$xpc"
     done
     if [ -d "$SPARKLE_FW/Versions/B/Updater.app" ]; then
-        codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Updater.app"
+        sign_item "$SPARKLE_FW/Versions/B/Updater.app"
     fi
     if [ -e "$SPARKLE_FW/Versions/B/Autoupdate" ]; then
-        codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Autoupdate"
+        sign_item "$SPARKLE_FW/Versions/B/Autoupdate"
     fi
-    codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW"
+    sign_item "$SPARKLE_FW"
 
-    codesign --force --options runtime --sign "$SIGN_ID" "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
-    codesign --force --options runtime --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
+    sign_item "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
+    sign_item --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 
     if [ "$NOTARIZE" = true ] && [[ "$SIGN_ID" == *"Developer ID"* ]]; then
         echo "Creating ZIP for notarization..."

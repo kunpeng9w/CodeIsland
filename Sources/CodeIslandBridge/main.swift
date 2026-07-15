@@ -287,10 +287,14 @@ if sourceTag == "copilot" {
     if let toolName = json["toolName"] as? String {
         json["tool_name"] = toolName
     }
-    if let toolArgsStr = json["toolArgs"] as? String,
-       let argsData = toolArgsStr.data(using: .utf8),
-       let argsObj = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
-        json["tool_input"] = argsObj
+    if json["tool_input"] == nil {
+        if let argsObj = json["toolArgs"] as? [String: Any] {
+            json["tool_input"] = argsObj
+        } else if let toolArgsStr = json["toolArgs"] as? String,
+                  let argsData = toolArgsStr.data(using: .utf8),
+                  let argsObj = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+            json["tool_input"] = argsObj
+        }
     }
 }
 
@@ -389,6 +393,12 @@ guard let sessionId = json["session_id"] as? String, !sessionId.isEmpty else {
     debugLog("no session_id, dropping")
     exit(0)
 }
+
+// VS Code Copilot does not emit PermissionRequest or indicate whether its own
+// approval UI will appear. Promote every PascalCase PreToolUse to CodeIsland's
+// blocking permission flow; Copilot CLI's lower-camel preToolUse is unaffected.
+let isVSCodeCopilotPreToolUseApproval = effectiveSource == "copilot"
+    && CopilotHookAdapter.promoteVSCodePreToolUseApproval(&json)
 
 // Event type detection
 let eventName = json["hook_event_name"] as? String ?? ""
@@ -536,9 +546,14 @@ if isBlocking {
 // of NWListener's main-thread handler and the event is lost
 let response = recvAll(sock)
 
-// Blocking events: forward response to stdout
+// Blocking events: forward the provider-specific response to stdout.
 if isBlocking && !response.isEmpty {
-    if sourceTag == "google-antigravity" || effectiveSource == "google-antigravity" || sourceTag == "gemini" || effectiveSource == "gemini" {
+    let hookResponse: Data
+    if isVSCodeCopilotPreToolUseApproval {
+        hookResponse = CopilotHookAdapter.vsCodePreToolUseResponse(from: response)
+    } else if effectiveSource == "copilot" {
+        hookResponse = CopilotHookAdapter.permissionResponse(from: response)
+    } else if isGeminiBasedSource {
         if let jsonObj = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
            let hookOutput = jsonObj["hookSpecificOutput"] as? [String: Any],
            let decisionObj = hookOutput["decision"] as? [String: Any],
@@ -546,24 +561,25 @@ if isBlocking && !response.isEmpty {
             let translatedBehavior = (behavior == "allow" || behavior == "always") ? "allow" : "deny"
             let responseDict = ["decision": translatedBehavior]
             if let responseData = try? JSONSerialization.data(withJSONObject: responseDict) {
-                FileHandle.standardOutput.write(responseData)
+                hookResponse = responseData
             } else {
-                FileHandle.standardOutput.write(response)
+                hookResponse = response
             }
         } else {
             // Fallback: search for "allow" or "deny" in raw string to be resilient
             let responseStr = String(data: response, encoding: .utf8) ?? ""
             if responseStr.contains("\"behavior\":\"allow\"") || responseStr.contains("\"behavior\":\"always\"") {
-                FileHandle.standardOutput.write(Data("{\"decision\":\"allow\"}".utf8))
+                hookResponse = Data("{\"decision\":\"allow\"}".utf8)
             } else if responseStr.contains("\"behavior\":\"deny\"") {
-                FileHandle.standardOutput.write(Data("{\"decision\":\"deny\"}".utf8))
+                hookResponse = Data("{\"decision\":\"deny\"}".utf8)
             } else {
-                FileHandle.standardOutput.write(response)
+                hookResponse = response
             }
         }
     } else {
-        FileHandle.standardOutput.write(response)
+        hookResponse = response
     }
+    FileHandle.standardOutput.write(hookResponse)
 }
 
 close(sock)

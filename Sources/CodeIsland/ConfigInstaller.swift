@@ -167,6 +167,8 @@ struct ConfigInstaller {
     private static let openclawDir = NSHomeDirectory() + "/.openclaw"
     private static let openclawPluginDir = NSHomeDirectory() + "/.openclaw/codeisland-plugin"
     private static let openclawConfigPath = NSHomeDirectory() + "/.openclaw/openclaw.json"
+    private static let vsCodeUserDir = NSHomeDirectory() + "/Library/Application Support/Code/User"
+    private static let vsCodeSettingsPath = vsCodeUserDir + "/settings.json"
 
 
     // Legacy paths for migration cleanup (#32)
@@ -400,14 +402,7 @@ struct ConfigInstaller {
             name: "Copilot", source: "copilot",
             configPath: ".copilot/hooks/codeisland.json", configKey: "hooks",
             format: .copilot,
-            events: [
-                ("sessionStart", 5, false),
-                ("sessionEnd", 5, true),
-                ("userPromptSubmitted", 5, false),
-                ("preToolUse", 5, false),
-                ("postToolUse", 5, true),
-                ("errorOccurred", 5, true),
-            ]
+            events: defaultEvents(for: .copilot)
         ),
         // Kimi Code CLI — TOML hooks in ~/.kimi/config.toml
         CLIConfig(
@@ -548,8 +543,17 @@ struct ConfigInstaller {
                 ("sessionStart", 5, false),
                 ("sessionEnd", 5, true),
                 ("userPromptSubmitted", 5, false),
-                ("preToolUse", 5, false),
+                // VS Code Copilot uses PreToolUse as its terminal approval hook,
+                // so this command may wait for a CodeIsland decision.
+                ("preToolUse", 86400, false),
                 ("postToolUse", 5, true),
+                ("postToolUseFailure", 5, true),
+                ("permissionRequest", 86400, false),
+                ("notification", 5, true),
+                ("agentStop", 5, true),
+                ("subagentStart", 5, true),
+                ("subagentStop", 5, true),
+                ("preCompact", 5, true),
                 ("errorOccurred", 5, true),
             ]
         case .kimi:
@@ -772,6 +776,13 @@ struct ConfigInstaller {
             }
         }
 
+        // VS Code does not discover ~/.copilot/hooks by default. Register the
+        // directory in user settings without rewriting unrelated JSONC content.
+        if isEnabled(source: "copilot"),
+           !ensureVSCodeCopilotHookLocation(fm: fm) {
+            ok = false
+        }
+
         // Codex requires hooks = true in config.toml
         if isEnabled(source: "codex"),
            fm.fileExists(atPath: codexHome()) {
@@ -919,6 +930,10 @@ struct ConfigInstaller {
             } else {
                 installExternalHooks(cli: cli, fm: fm)
                 if cli.source == "codex" { enableCodexHooksConfig(fm: fm) }
+                if cli.source == "copilot",
+                   !ensureVSCodeCopilotHookLocation(fm: fm) {
+                    return false
+                }
                 return isHooksInstalled(for: cli, fm: fm)
             }
         } else {
@@ -1024,6 +1039,9 @@ struct ConfigInstaller {
            fm.fileExists(atPath: codexHome()) {
             enableCodexHooksConfig(fm: fm)
         }
+        if isEnabled(source: "copilot") {
+            _ = ensureVSCodeCopilotHookLocation(fm: fm)
+        }
         // OpenCode plugin
         if isEnabled(source: "opencode"),
            fm.fileExists(atPath: (opencodeConfigPath as NSString).deletingLastPathComponent),
@@ -1097,6 +1115,44 @@ struct ConfigInstaller {
             i = input.index(after: i)
         }
         return result
+    }
+
+    /// Add CodeIsland's Copilot hook directory to VS Code's hook discovery
+    /// setting while preserving every unrelated byte in settings.json.
+    static func mergeVSCodeCopilotHookLocation(in contents: String) -> String? {
+        JSONMinimalEditor.setTopLevelObjectMember(
+            in: contents.isEmpty ? "{}\n" : contents,
+            objectKey: "chat.hookFilesLocations",
+            memberKey: "~/.copilot/hooks",
+            value: true
+        )
+    }
+
+    @discardableResult
+    static func ensureVSCodeCopilotHookLocation(
+        fm: FileManager,
+        settingsPath: String = vsCodeSettingsPath
+    ) -> Bool {
+        let userDir = (settingsPath as NSString).deletingLastPathComponent
+        guard fm.fileExists(atPath: userDir) || fm.fileExists(atPath: settingsPath) else {
+            return true
+        }
+
+        let original: String
+        if fm.fileExists(atPath: settingsPath) {
+            guard let data = fm.contents(atPath: settingsPath),
+                  let contents = String(data: data, encoding: .utf8) else {
+                return false
+            }
+            original = contents
+        } else {
+            original = "{}\n"
+        }
+        guard let merged = mergeVSCodeCopilotHookLocation(in: original) else {
+            return false
+        }
+        if merged == original { return true }
+        return fm.createFile(atPath: settingsPath, contents: Data(merged.utf8))
     }
 
     /// Parse a JSON file, stripping JSONC comments first
@@ -2546,6 +2602,9 @@ struct ConfigInstaller {
 
         guard let root = parseJSONFile(at: cli.fullPath, fm: fm),
               let hooks = root[cli.configKey] as? [String: Any] else { return false }
+        if cli.format == .copilot, copilotHooksNeedMigration(hooks) {
+            return false
+        }
         // Check that ALL required events have our hook installed, not just any one
         let allPresent = cli.events.allSatisfy { (event, _, _) in
             guard let entries = hooks[event] as? [[String: Any]] else { return false }
@@ -2570,11 +2629,38 @@ struct ConfigInstaller {
         }
     }
 
+    static func copilotHooksNeedMigration(_ hooks: [String: Any]) -> Bool {
+        let legacyEvents: Set<String> = [
+            "sessionStart",
+            "sessionEnd",
+            "userPromptSubmitted",
+            "preToolUse",
+            "postToolUse",
+            "errorOccurred",
+        ]
+        let installedEvents = Set(hooks.compactMap { event, value -> String? in
+            guard let entries = value as? [[String: Any]],
+                  entries.contains(where: containsOurHook) else { return nil }
+            return event
+        })
+        if installedEvents == legacyEvents {
+            return true
+        }
+
+        guard let entries = hooks["preToolUse"] as? [[String: Any]],
+              let entry = entries.first(where: containsOurHook),
+              let timeout = entry["timeoutSec"] as? NSNumber else {
+            return false
+        }
+        return timeout.intValue < 86_400
+    }
+
     private static func shouldPreservePartialHooks(for cli: CLIConfig, fm: FileManager) -> Bool {
         // Kimi stores hooks in TOML with its own all-or-nothing detection.
         if cli.format == .kimi { return false }
         guard let root = parseJSONFile(at: cli.fullPath, fm: fm),
               let hooks = root[cli.configKey] as? [String: Any] else { return false }
+        if cli.format == .copilot, copilotHooksNeedMigration(hooks) { return false }
         return shouldPreservePartialHooks(hooks: hooks, events: cli.events)
     }
 

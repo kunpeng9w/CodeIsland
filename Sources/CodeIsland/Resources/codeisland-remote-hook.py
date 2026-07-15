@@ -5,7 +5,7 @@ import socket
 import subprocess
 import sys
 
-VERSION = "0.1.2"
+VERSION = "0.1.4"
 # Per-user socket path (#193): CodeIsland injects CODEISLAND_SOCKET_PATH via the hook
 # command, but fall back to a uid-scoped path so multiple users on a shared host never
 # collide on a single /tmp/codeisland.sock.
@@ -61,6 +61,20 @@ def _normalize_event(name):
         return "PreToolUse"
     if name == "postToolUse":
         return "PostToolUse"
+    if name == "postToolUseFailure":
+        return "PostToolUseFailure"
+    if name == "permissionRequest":
+        return "PermissionRequest"
+    if name == "notification":
+        return "Notification"
+    if name == "agentStop":
+        return "Stop"
+    if name == "subagentStart":
+        return "SubagentStart"
+    if name == "subagentStop":
+        return "SubagentStop"
+    if name == "preCompact":
+        return "PreCompact"
     if name == "errorOccurred":
         return "Notification"
     # TraeCli (snake_case)
@@ -182,6 +196,61 @@ def _read_stdin_json():
         return None
 
 
+def _event_arg():
+    try:
+        index = sys.argv.index("--event")
+        return sys.argv[index + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _copilot_permission_response(response):
+    try:
+        root = json.loads(response)
+    except Exception:
+        return response
+    if isinstance(root.get("behavior"), str):
+        return response
+    output = root.get("hookSpecificOutput")
+    decision = output.get("decision") if isinstance(output, dict) else None
+    behavior = decision.get("behavior") if isinstance(decision, dict) else None
+    if behavior not in ("allow", "deny"):
+        return response
+    result = {"behavior": behavior}
+    message = decision.get("message") or decision.get("reason")
+    if isinstance(message, str):
+        result["message"] = message
+    if isinstance(decision.get("interrupt"), bool):
+        result["interrupt"] = decision["interrupt"]
+    return json.dumps(result)
+
+
+def _vscode_pre_tool_response(response):
+    try:
+        root = json.loads(response)
+    except Exception:
+        return response
+    output = root.get("hookSpecificOutput")
+    decision = output.get("decision") if isinstance(output, dict) else None
+    behavior = root.get("behavior") or (
+        decision.get("behavior") if isinstance(decision, dict) else None
+    )
+    if behavior not in ("allow", "deny"):
+        return response
+    hook_output = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": behavior,
+    }
+    reason = root.get("message") or (
+        (decision.get("message") or decision.get("reason"))
+        if isinstance(decision, dict)
+        else None
+    )
+    if isinstance(reason, str):
+        hook_output["permissionDecisionReason"] = reason
+    return json.dumps({"hookSpecificOutput": hook_output})
+
+
 def _send_event(payload, expects_response):
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(TIMEOUT_SECONDS)
@@ -239,8 +308,13 @@ def main():
     if not data:
         return 1
 
-    event_name = data.get("hook_event_name") or data.get("event")
-    session_id = data.get("session_id")
+    event_name = (
+        data.get("hook_event_name")
+        or data.get("hookEventName")
+        or data.get("event")
+        or _event_arg()
+    )
+    session_id = data.get("session_id") or data.get("sessionId")
     cwd = data.get("cwd") or os.getcwd()
     if not event_name or not session_id:
         return 1
@@ -250,11 +324,37 @@ def main():
     payload = dict(data)
     payload["hook_event_name"] = event_name
     payload["session_id"] = session_id
+    if not payload.get("tool_name") and payload.get("toolName"):
+        payload["tool_name"] = payload["toolName"]
+    if payload.get("tool_input") is None and payload.get("toolArgs") is not None:
+        tool_args = payload["toolArgs"]
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                pass
+        payload["tool_input"] = tool_args
     payload["cwd"] = cwd
     payload["_source"] = payload.get("_source") or SOURCE
     payload["_remote_host_id"] = payload.get("_remote_host_id") or REMOTE_HOST_ID
     payload["_remote_host_name"] = payload.get("_remote_host_name") or REMOTE_HOST_NAME
     payload["_tty"] = payload.get("_tty") or _get_tty()
+
+    # VS Code exposes approval control only through PascalCase PreToolUse and
+    # does not say whether its native UI will ask later. Promote every tool so
+    # CodeIsland becomes the single approval surface. Copilot CLI uses the
+    # lower-camel preToolUse and is unaffected.
+    is_vscode_pre_tool_approval = (
+        SOURCE == "copilot" and event_name == "PreToolUse" and payload.get("tool_name")
+    )
+    if is_vscode_pre_tool_approval:
+        payload["_copilot_hook_event_name"] = "PreToolUse"
+        payload["hook_event_name"] = "PermissionRequest"
+        if payload.get("tool_name") in {
+            "bash", "powershell", "local_shell", "runInTerminal", "run_in_terminal", "Bash"
+        }:
+            payload["tool_name"] = "Bash"
+        normalized_event = "PermissionRequest"
 
     if SOURCE == "claude":
         extras = _scan_claude_jsonl(session_id, cwd)
@@ -282,7 +382,13 @@ def main():
     )
     response = _send_event(payload, expects_response)
     if response:
-        if SOURCE == "google-antigravity" or SOURCE == "gemini":
+        if is_vscode_pre_tool_approval:
+            response = _vscode_pre_tool_response(response)
+            sys.stdout.write(response)
+        elif SOURCE == "copilot" and normalized_event == "PermissionRequest":
+            response = _copilot_permission_response(response)
+            sys.stdout.write(response)
+        elif SOURCE == "google-antigravity" or SOURCE == "gemini":
             try:
                 res_obj = json.loads(response)
                 behavior = res_obj.get("hookSpecificOutput", {}).get("decision", {}).get("behavior")

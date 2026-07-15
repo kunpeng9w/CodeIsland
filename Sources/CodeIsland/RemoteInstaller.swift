@@ -14,7 +14,7 @@ private struct RemoteCommandResult: Sendable {
 }
 
 enum RemoteInstaller {
-    private static let remoteHookVersion = "0.1.2"
+    private static let remoteHookVersion = "0.1.4"
     private static let remoteOpencodePluginVersion = "v2"
 
     static func installAll(host: RemoteHost, remoteSocketPath: String) async -> RemoteInstallResult {
@@ -40,7 +40,7 @@ enum RemoteInstaller {
             return RemoteInstallResult(ok: false, message: "Install failed: \(configure.stderrSummary)")
         }
 
-        let summary = configure.stdoutSummary.isEmpty ? "Claude/Codex/CodeBuddy/Traecli/OpenCode remote hooks installed" : configure.stdoutSummary
+        let summary = configure.stdoutSummary.isEmpty ? "Claude/Codex/Copilot/CodeBuddy/Traecli/OpenCode remote hooks installed" : configure.stdoutSummary
         return RemoteInstallResult(ok: true, message: summary)
     }
 
@@ -782,14 +782,59 @@ def install_codex():
     remove_our_hooks(hooks)
 
     cmd = command_for("codex")
-    entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 60}]}]
-    append_our_hooks(hooks, "SessionStart", entry)
-    append_our_hooks(hooks, "UserPromptSubmit", entry)
-    append_our_hooks(hooks, "Stop", entry)
+    short_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 60}]}]
+    long_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 86400}]}]
+    append_our_hooks(hooks, "SessionStart", short_entry)
+    append_our_hooks(hooks, "SessionEnd", short_entry)
+    append_our_hooks(hooks, "UserPromptSubmit", short_entry)
+    append_our_hooks(hooks, "PreToolUse", short_entry)
+    append_our_hooks(hooks, "PostToolUse", short_entry)
+    append_our_hooks(hooks, "PermissionRequest", long_entry)
+    append_our_hooks(hooks, "Stop", short_entry)
     data["hooks"] = hooks
     write_json(hooks_path, data)
     ensure_toml_codex_hooks(codex_root / "config.toml")
     return "Codex ok"
+
+COPILOT_EVENTS = [
+    ("sessionStart", 5),
+    ("sessionEnd", 5),
+    ("userPromptSubmitted", 5),
+    ("preToolUse", 86400),
+    ("postToolUse", 5),
+    ("postToolUseFailure", 5),
+    ("permissionRequest", 86400),
+    ("notification", 5),
+    ("agentStop", 5),
+    ("subagentStart", 5),
+    ("subagentStop", 5),
+    ("preCompact", 5),
+    ("errorOccurred", 5),
+]
+
+def install_copilot():
+    copilot_root = home / ".copilot"
+    vscode_remote_present = (home / ".vscode-server").exists() or (home / ".vscode-remote").exists()
+    if not copilot_root.exists() and not vscode_remote_present and shutil.which("copilot") is None:
+        return "Copilot skipped"
+
+    config_path = copilot_root / "hooks" / "codeisland.json"
+    data = ensure_json(config_path)
+    hooks = data.get("hooks") or {}
+    remove_our_hooks(hooks)
+
+    cmd = command_for("copilot")
+    for event, timeout in COPILOT_EVENTS:
+        event_cmd = f"{cmd} --event {event}"
+        append_our_hooks(
+            hooks,
+            event,
+            [{"type": "command", "bash": event_cmd, "timeoutSec": timeout}],
+        )
+    data["version"] = data.get("version") or 1
+    data["hooks"] = hooks
+    write_json(config_path, data)
+    return "Copilot ok"
 
 def install_codebuddy():
     codebuddy_root = home / ".codebuddy"
@@ -905,7 +950,7 @@ def install_custom():
         results.append(cli["name"] + " ok")
     return results
 
-parts = [install_claude(), install_hermes(), install_codex(), install_codebuddy(), install_traecli(), install_opencode()] + install_custom()
+parts = [install_claude(), install_hermes(), install_codex(), install_copilot(), install_codebuddy(), install_traecli(), install_opencode()] + install_custom()
 print(" · ".join(parts))
 """
     }
